@@ -18,6 +18,7 @@
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>python3-pil</exec_depend>
   <exec_depend>ffmpeg</exec_depend>
+  <exec_depend>foxglove_msgs</exec_depend>
   <exec_depend>gstreamer1.0-tools</exec_depend>
   <exec_depend>gstreamer1.0-plugins-base</exec_depend>
   <exec_depend>gstreamer1.0-plugins-good</exec_depend>

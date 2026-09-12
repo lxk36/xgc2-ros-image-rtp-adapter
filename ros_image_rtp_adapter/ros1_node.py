@@ -22,11 +22,18 @@ class ImageRtpAdapterROS1Node:
                 f"invalid image RTP adapter configuration: {exc}"
             )
 
+        video_topic = str(rospy.get_param("~video_topic", "")).strip()
+        self._video_publisher = None
+        if video_topic:
+            from foxglove_msgs.msg import CompressedVideo
+            self._video_message_type = CompressedVideo
+            self._video_publisher = rospy.Publisher(video_topic, CompressedVideo, queue_size=2)
         self._runtime = ImageRtpAdapterRuntime(
             self._settings,
             log_info=rospy.loginfo,
             log_warning=rospy.logwarn,
             log_error=rospy.logerr,
+            on_access_unit=self._publish_video if video_topic else None,
         )
         self._runtime.start()
         rospy.on_shutdown(self._runtime.stop)
@@ -47,6 +54,7 @@ class ImageRtpAdapterROS1Node:
                 queue_size=10,
                 buff_size=64 * 1024 * 1024,
             )
+        self._video_timer = rospy.Timer(rospy.Duration(0.25), self._update_video_consumer)
         self._status_timer = rospy.Timer(rospy.Duration.from_sec(5.0), self._log_status)
         rospy.loginfo(
             "image_rtp_adapter ready: ros=1 topic=%s message=%s source_id=%s "
@@ -62,7 +70,8 @@ class ImageRtpAdapterROS1Node:
         )
 
     def _on_compressed_image(self, message: CompressedImage) -> None:
-        self._runtime.submit_compressed(bytes(message.data), message.format)
+        self._runtime.submit_compressed(
+            bytes(message.data), message.format, source_stamp_ns=message.header.stamp.to_nsec())
 
     def _on_raw_image(self, message: Image) -> None:
         self._runtime.submit_raw(
@@ -71,7 +80,22 @@ class ImageRtpAdapterROS1Node:
             height=message.height,
             step=message.step,
             encoding=message.encoding,
+            source_stamp_ns=message.header.stamp.to_nsec(),
         )
+
+    def _update_video_consumer(self, _event) -> None:
+        if self._video_publisher is not None and not rospy.is_shutdown():
+            self._runtime.set_video_active(self._video_publisher.get_num_connections() > 0)
+
+    def _publish_video(self, data: bytes, stamp_ns: int) -> None:
+        if rospy.is_shutdown() or self._video_publisher is None:
+            return
+        message = self._video_message_type()
+        message.timestamp = rospy.Time(stamp_ns // 1_000_000_000, stamp_ns % 1_000_000_000)
+        message.frame_id = self._settings.frame_id
+        message.format = "h264"
+        message.data = data
+        self._video_publisher.publish(message)
 
     def _log_status(self, _event) -> None:
         status = self._runtime.status()

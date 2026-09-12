@@ -15,8 +15,9 @@ import re
 import signal
 import subprocess
 import threading
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Callable, Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
+from ros_image_rtp_adapter.h264 import AnnexBAccessUnits
 
 PropertyValue = Union[str, int, float, bool]
 PropertyInput = Union[str, Mapping[str, PropertyValue]]
@@ -111,6 +112,9 @@ class SubprocessRtpEncoder:
         self._lock = threading.Lock()
         self._runtime_validated = False
         self._stderr_tail = deque(maxlen=20)
+        self._access_unit_callback = None
+        self._source_stamps = deque()
+        self._metadata_lock = threading.Lock()
 
     @property
     def running(self) -> bool:
@@ -142,13 +146,32 @@ class SubprocessRtpEncoder:
             self._proc = None
         self._stop_process(proc)
 
-    def write_frame(self, frame: bytes) -> None:
+    def set_access_unit_callback(self, callback: Callable[[bytes, int], None]) -> None:
+        if not isinstance(self, FFmpegRtpEncoder):
+            raise ValueError("ROS H264 preview requires the FFmpeg encoder backend")
+        if self._proc is not None:
+            raise RuntimeError("configure H264 preview before starting the encoder")
+        self._access_unit_callback = callback
+
+    def write_frame(self, frame: bytes, source_stamp_ns: Optional[int] = None) -> None:
         with self._lock:
             proc = self._proc
             if proc is None or proc.stdin is None:
                 return
+            if self._access_unit_callback is not None:
+                if source_stamp_ns is None or source_stamp_ns <= 0:
+                    raise ValueError("H264 preview requires the source image timestamp")
+                with self._metadata_lock:
+                    if len(self._source_stamps) >= 64:
+                        raise RuntimeError("H264 encoder output stalled")
+                    self._source_stamps.append(source_stamp_ns)
             try:
-                proc.stdin.write(frame)
+                remaining = memoryview(frame)
+                while remaining:
+                    written = proc.stdin.write(remaining)
+                    if written is None or written <= 0:
+                        raise BrokenPipeError("encoder input pipe stopped accepting data")
+                    remaining = remaining[written:]
                 proc.stdin.flush()
             except (BrokenPipeError, OSError):
                 self._restart_locked()
@@ -172,12 +195,17 @@ class SubprocessRtpEncoder:
         proc = subprocess.Popen(
             self._build_command(),
             stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
+            stdout=subprocess.PIPE if self._access_unit_callback else subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             bufsize=0,
         )
-        self._proc = proc
+        with self._metadata_lock:
+            self._source_stamps.clear()
+            self._proc = proc
         self._stderr_tail.clear()
+        if self._access_unit_callback:
+            threading.Thread(target=self._drain_access_units, args=(proc,), daemon=True,
+                             name="h264-preview-output").start()
         threading.Thread(target=self._drain_stderr, args=(proc,), daemon=True).start()
 
     def _restart_locked(self) -> None:
@@ -215,6 +243,30 @@ class SubprocessRtpEncoder:
             proc.wait(timeout=1)
         except (OSError, subprocess.TimeoutExpired):
             pass
+
+    def _drain_access_units(self, proc: subprocess.Popen) -> None:
+        parser = AnnexBAccessUnits()
+        def emit(unit):
+            with self._metadata_lock:
+                if self._proc is not proc:
+                    return
+                if not self._source_stamps:
+                    raise RuntimeError("H264 output has no matching source timestamp")
+                stamp = self._source_stamps.popleft()
+            self._access_unit_callback(unit, stamp)
+        try:
+            while self._proc is proc:
+                data = proc.stdout.read(65536)
+                if not data:
+                    break
+                for unit in parser.feed(data):
+                    emit(unit)
+            for unit in parser.finish():
+                emit(unit)
+        except Exception as exc:
+            self._stderr_tail.append(f"H264 preview output failed: {exc}")
+            if proc.poll() is None:
+                proc.kill()
 
     def _drain_stderr(self, proc: subprocess.Popen) -> None:
         if proc.stderr is None:
@@ -293,10 +345,12 @@ class FFmpegRtpEncoder(SubprocessRtpEncoder):
             "-loglevel",
             "error",
             "-fflags",
-            "nobuffer",
+            "+genpts" if self._access_unit_callback else "nobuffer",
             "-flags",
             "low_delay",
         ]
+        if self._access_unit_callback:
+            command.extend(["-probesize", "32", "-analyzeduration", "0", "-threads", "1"])
         if self._input_format == "jpeg":
             # image2pipe + mjpeg accepts concatenated complete JPEG frames.
             command.extend(
@@ -374,7 +428,9 @@ class FFmpegRtpEncoder(SubprocessRtpEncoder):
                     "-zerolatency",
                     "1",
                     "-delay",
-                    "0",
+                    # MJPEG CPU decode and NVENC can overlap across bounded surfaces.
+                    # Zero serializes both stages on each frame (4K falls below 30 Hz).
+                    "2" if self._input_format == "jpeg" else "0",
                     "-rc-lookahead",
                     "0",
                     "-bf",
@@ -402,15 +458,18 @@ class FFmpegRtpEncoder(SubprocessRtpEncoder):
             # ffmpeg_encoder_args_json so no vendor assumptions leak here.
             command.extend(["-b:v", str(self._bitrate), "-g", str(gop)])
 
-        command.extend(
-            [
-                "-f",
-                "rtp",
-                "-payload_type",
-                "96",
+        if self._access_unit_callback:
+            command.extend([
+                "-xerror", "-vsync", "0", "-bf", "0", "-map", "0:v:0",
+                "-bsf:v", "dump_extra=freq=keyframe,h264_metadata=aud=insert",
+                "-f", "tee",
+                f"[f=rtp:payload_type=96]rtp://{self._rtp_host}:{self._rtp_port}?pkt_size=1200|[f=h264:flush_packets=1]pipe:1",
+            ])
+        else:
+            command.extend([
+                "-f", "rtp", "-payload_type", "96",
                 f"rtp://{self._rtp_host}:{self._rtp_port}?pkt_size=1200",
-            ]
-        )
+            ])
         return command
 
     def _expand_arguments(self, arguments: Sequence[str], gop: int) -> List[str]:

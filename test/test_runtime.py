@@ -174,3 +174,39 @@ def test_started_runtime_pumps_each_arriving_frame_without_a_same_rate_poll_time
         assert runtime.status()["frames_dropped"] == 0
     finally:
         runtime.stop()
+
+
+def test_ros_preview_and_edge_share_one_encoder_consumer_lifetime(tmp_path):
+    runtime, encoder = make_runtime(tmp_path)
+    runtime.set_video_active(True)
+    assert encoder.running
+    runtime.set_active(True)
+    runtime.set_active(False)
+    assert encoder.running  # Closing WebRTC must not stop ROS AR.
+    runtime.set_video_active(False)
+    assert not encoder.running
+    runtime.set_active(True)
+    runtime.set_video_active(True)
+    runtime.set_video_active(False)
+    assert encoder.running  # Closing AR must not stop WebRTC.
+    runtime.set_active(False)
+    assert not encoder.running
+
+
+def test_h264_timestamp_follows_kept_source_after_input_drop(tmp_path):
+    class VideoEncoder(FakeEncoder):
+        def set_access_unit_callback(self, callback):
+            self.callback = callback
+        def write_frame(self, frame, stamp):
+            self.frames.append((frame, stamp))
+    encoder = VideoEncoder()
+    settings = AdapterSettings.from_mapping({"control_socket": str(tmp_path / "video.sock")})
+    runtime = ImageRtpAdapterRuntime(settings, encoder_factory=lambda **kw: encoder,
+                                   on_access_unit=lambda data, stamp: None)
+    runtime.set_video_active(True)
+    jpeg = b"\xff\xd8frame\xff\xd9"
+    assert not runtime.submit_compressed(jpeg, "jpeg", source_stamp_ns=0)
+    runtime.submit_compressed(jpeg, "jpeg", source_stamp_ns=10)
+    runtime.submit_compressed(jpeg, "jpeg", source_stamp_ns=20)
+    assert runtime.pump()
+    assert encoder.frames == [(jpeg, 20)]

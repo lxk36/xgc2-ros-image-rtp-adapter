@@ -29,6 +29,7 @@ EncoderFactory = Callable[..., SubprocessRtpEncoder]
 @dataclass(frozen=True)
 class _QueuedFrame:
     encoder_data: bytes
+    source_stamp_ns: Optional[int] = None
     jpeg_snapshot: Optional[bytes] = None
     raw_snapshot: Optional[RawFrame] = None
 
@@ -44,6 +45,7 @@ class ImageRtpAdapterRuntime:
         log_warning: Optional[LogFunction] = None,
         log_error: Optional[LogFunction] = None,
         encoder_factory: EncoderFactory = create_rtp_encoder,
+        on_access_unit: Optional[Callable[[bytes, int], None]] = None,
     ) -> None:
         self.settings = settings
         self._log_info = log_info or (lambda _message: None)
@@ -53,6 +55,12 @@ class ImageRtpAdapterRuntime:
             backend=settings.encoder_backend,
             **settings.encoder_kwargs(),
         )
+        self._on_access_unit = on_access_unit
+        if on_access_unit is not None:
+            self._encoder.set_access_unit_callback(on_access_unit)
+        self._consumer_lock = threading.Lock()
+        self._edge_active = False
+        self._video_active = False
         self._lock = threading.Lock()
         self._frame_condition = threading.Condition(self._lock)
         self._encoder_lock = threading.Lock()
@@ -148,6 +156,16 @@ class ImageRtpAdapterRuntime:
                 self._encoder.stop()
 
     def set_active(self, active: bool) -> None:
+        with self._consumer_lock:
+            self._edge_active = bool(active)
+            self._set_encoder_active(self._edge_active or self._video_active)
+
+    def set_video_active(self, active: bool) -> None:
+        with self._consumer_lock:
+            self._video_active = bool(active)
+            self._set_encoder_active(self._edge_active or self._video_active)
+
+    def _set_encoder_active(self, active: bool) -> None:
         desired = bool(active)
         with self._encoder_lock:
             with self._lock:
@@ -171,7 +189,7 @@ class ImageRtpAdapterRuntime:
                 raise
         self._log_info(f"set-active -> {desired}")
 
-    def submit_compressed(self, data: bytes, image_format: str) -> bool:
+    def submit_compressed(self, data: bytes, image_format: str, *, source_stamp_ns: Optional[int] = None) -> bool:
         if self.settings.input_message_type != "compressed":
             self._warn_validation("received CompressedImage while input_message_type=raw")
             return False
@@ -196,7 +214,7 @@ class ImageRtpAdapterRuntime:
             return False
         if not frame:
             return False
-        return self._enqueue(_QueuedFrame(encoder_data=frame, jpeg_snapshot=frame))
+        return self._enqueue(_QueuedFrame(encoder_data=frame, jpeg_snapshot=frame, source_stamp_ns=source_stamp_ns))
 
     def submit_raw(
         self,
@@ -206,6 +224,7 @@ class ImageRtpAdapterRuntime:
         height: int,
         step: int,
         encoding: str,
+        source_stamp_ns: Optional[int] = None,
     ) -> bool:
         if self.settings.input_message_type != "raw":
             self._warn_validation("received Image while input_message_type=compressed")
@@ -224,9 +243,12 @@ class ImageRtpAdapterRuntime:
         except FrameValidationError as exc:
             self._warn_validation(str(exc))
             return False
-        return self._enqueue(_QueuedFrame(encoder_data=raw.data, raw_snapshot=raw))
+        return self._enqueue(_QueuedFrame(encoder_data=raw.data, raw_snapshot=raw, source_stamp_ns=source_stamp_ns))
 
     def _enqueue(self, frame: _QueuedFrame) -> bool:
+        if self._on_access_unit and (frame.source_stamp_ns is None or frame.source_stamp_ns <= 0):
+            self._warn_validation("H264 preview requires a valid source image timestamp")
+            return False
         with self._frame_condition:
             self._latest = frame
             self._frames_in += 1
@@ -244,7 +266,10 @@ class ImageRtpAdapterRuntime:
                 if not self._active or not self._pending:
                     return False
                 frame = self._pending.popleft()
-            self._encoder.write_frame(frame.encoder_data)
+            if self._on_access_unit:
+                self._encoder.write_frame(frame.encoder_data, frame.source_stamp_ns)
+            else:
+                self._encoder.write_frame(frame.encoder_data)
         with self._lock:
             self._frames_out += 1
         return True

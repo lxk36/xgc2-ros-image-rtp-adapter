@@ -284,3 +284,26 @@ dependency_set_digest="$(python3 .xgc2/scripts/read_integration_lock.py \
 ## License
 
 Apache-2.0
+
+
+### ROS 1 H264 preview shared with RTP
+
+An explicit `~video_topic` enables `foxglove_msgs/CompressedVideo` output from
+the same FFmpeg encoding operation used for RTP. The original ROS Image or
+CompressedImage timestamp follows the retained frame through the bounded input
+queue. No second JPEG decode/encode pass is introduced for the viewer. ROS
+subscribers and Media Edge independently hold the encoder active; closing one
+consumer does not stop the other. This output currently requires FFmpeg and
+zero B-frames. JPEG snapshots remain source-resolution passthrough.
+
+The Annex-B stream contains AUD boundaries and repeated parameter sets for
+late joins at the next IDR. Its bounded framing reader emits a frame when the
+next AUD arrives (one frame of framing delay); it does not label decode time as
+capture time. Missing source timestamps are rejected. GStreamer keeps its
+existing RTP-only path until an equivalent encoded-packet tap is implemented.
+
+For JPEG input with NVENC, two bounded encoder output-delay frames allow CPU JPEG
+decode to overlap GPU encoding. Raw input keeps zero output delay. This buffering
+is separate from the drop-to-latest source queue; it does not enable B-frames or
+an unbounded display backlog. Hardware frame-identity and late-join tests can be
+run with `XGC2_TEST_NVENC=1 python3 -m pytest -q test/test_h264_integration.py`.

@@ -49,6 +49,7 @@ def test_keyframe_request_does_not_restart_live_ffmpeg_process():
     encoder = make_encoder()
     process = Mock()
     process.stdin = Mock()
+    process.stdin.write.return_value = 4
     encoder._proc = process
 
     with patch("ros_image_rtp_adapter.encoder.subprocess.Popen") as popen:
@@ -74,6 +75,7 @@ def test_nvenc_uses_a_bounded_low_latency_burst_contract():
     assert command[command.index("-maxrate") + 1] == "2500000"
     assert command[command.index("-bufsize") + 1] == "2500000"
     assert command[command.index("-bf") + 1] == "0"
+    assert command[command.index("-delay") + 1] == "2"
     assert command[command.index("-strict_gop") + 1] == "1"
     assert command[command.index("-no-scenecut") + 1] == "1"
 
@@ -227,3 +229,13 @@ def test_gstreamer_preflight_rejects_unknown_configured_properties():
     ):
         with pytest.raises(RuntimeError, match="not-a-property"):
             encoder.validate_runtime()
+
+
+def test_encoder_finishes_short_pipe_writes_before_accepting_next_frame():
+    encoder = make_encoder()
+    process = Mock()
+    process.stdin.write.side_effect = [2, 2]
+    encoder._proc = process
+    encoder.write_frame(b"jpeg")
+    assert [bytes(call.args[0]) for call in process.stdin.write.call_args_list] == [b"jpeg", b"eg"]
+    process.stdin.flush.assert_called_once_with()
